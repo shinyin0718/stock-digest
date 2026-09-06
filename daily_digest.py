@@ -3,12 +3,16 @@
 Daily stock/ETF digest.
 
 Pulls yesterday's close-to-close move for a watchlist, works out which moves
-are actually idiosyncratic (vs. the whole market moving), and attaches recent
-headlines for the names that moved.
+are actually idiosyncratic (vs. the whole market moving), and uses Claude to
+turn the raw headlines into one plain-English explanation per notable move.
 
-Free stack: yfinance (prices) + Google News RSS (headlines). No API keys.
+Stack: yfinance (prices, free) + Google News RSS (headlines, free) +
+Anthropic API (synthesis, ~$0.01-0.05/month for a ~10-ticker watchlist on
+Haiku). Set ANTHROPIC_API_KEY to enable synthesis; without it, the script
+falls back to listing raw headlines.
 
-    pip install yfinance feedparser requests pandas
+    pip install yfinance feedparser requests pandas anthropic
+    export ANTHROPIC_API_KEY=sk-ant-...
     python daily_digest.py
 """
 
@@ -21,6 +25,11 @@ import feedparser
 import pandas as pd
 import requests
 import yfinance as yf
+
+try:
+    import anthropic
+except ImportError:
+    anthropic = None
 
 # ---------------------------------------------------------------- config ----
 
@@ -43,6 +52,9 @@ HEADLINES_PER_NAME = 4
 NEWS_WINDOW_DAYS = 2
 
 OUTPUT_DIR = "digests"
+
+SYNTHESIS_MODEL = "claude-haiku-4-5-20251001"
+_client = anthropic.Anthropic() if (anthropic and os.environ.get("ANTHROPIC_API_KEY")) else None
 
 # --------------------------------------------------------------- prices -----
 
@@ -123,6 +135,54 @@ def fetch_news(name, ticker, limit=HEADLINES_PER_NAME):
     return items
 
 
+# ------------------------------------------------------------ synthesis ----
+
+
+def synthesize_explanation(ticker, name, pct, rel, vol_ratio, headlines):
+    """
+    Ask Claude to turn raw headlines into 1-2 plain-English sentences on why
+    the stock likely moved. Returns None if synthesis isn't available or the
+    headlines don't actually support a confident explanation - callers should
+    fall back to listing raw headlines in that case.
+    """
+    if not _client or not headlines:
+        return None
+
+    headline_lines = "\n".join(
+        f"- {h['headline']} ({h['publisher'] or 'unknown source'})" for h in headlines
+    )
+    driver = "roughly in line with the overall market" if abs(rel) < RELATIVE_THRESHOLD else "moving independently of the market"
+
+    prompt = f"""A stock moved today. Here is the data and recent headlines mentioning it.
+
+Ticker: {ticker} ({name})
+Move: {pct:+.2f}% ({driver}, {rel:+.2f}pp vs S&P 500)
+Volume: {vol_ratio:.1f}x the 20-day average
+
+Recent headlines:
+{headline_lines}
+
+Write 1-2 sentences a reader can understand without clicking through, explaining \
+the likely reason for this move based on the headlines above. Be concrete (name \
+the actual event - earnings, guidance, an analyst call, a product news, a \
+macro/sector move, etc.) rather than generic. If the headlines don't clearly \
+explain a move of this size, say so plainly instead of guessing - do not invent \
+a reason that isn't supported by the headlines. Do not use hedging filler like \
+"it appears" or "this suggests." Output only the explanation, no preamble."""
+
+    try:
+        resp = _client.messages.create(
+            model=SYNTHESIS_MODEL,
+            max_tokens=150,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = "".join(b.text for b in resp.content if b.type == "text").strip()
+        return text or None
+    except Exception as e:  # noqa: BLE001 - never let synthesis kill the run
+        print(f"  ! synthesis failed for {ticker}: {e}", file=sys.stderr)
+        return None
+
+
 # --------------------------------------------------------------- report -----
 
 
@@ -163,6 +223,7 @@ def build_report(prices, bench_pct):
 
     lines.append("## What moved")
     lines.append("")
+    used_synthesis = False
     for t, p in notable:
         rel = p["pct"] - bench_pct
         driver = "market-wide" if abs(rel) < RELATIVE_THRESHOLD else "stock-specific"
@@ -171,16 +232,43 @@ def build_report(prices, bench_pct):
             lines.append(f"Volume {p['vol_ratio']:.1f}x the 20-day average.")
         lines.append("")
 
-        for item in fetch_news(WATCHLIST.get(t, t), t):
-            pub = f" — _{item['publisher']}_" if item["publisher"] else ""
-            lines.append(f"- [{item['headline']}]({item['link']}){pub}")
+        headlines = fetch_news(WATCHLIST.get(t, t), t)
+        explanation = synthesize_explanation(
+            t, WATCHLIST.get(t, t), p["pct"], rel, p["vol_ratio"], headlines
+        )
+
+        if explanation:
+            used_synthesis = True
+            lines.append(explanation)
+            lines.append("")
+            lines.append("<details><summary>Sources</summary>")
+            lines.append("")
+            for item in headlines:
+                pub = f" — _{item['publisher']}_" if item["publisher"] else ""
+                lines.append(f"- [{item['headline']}]({item['link']}){pub}")
+            lines.append("")
+            lines.append("</details>")
+        elif headlines:
+            lines.append("_No synthesized explanation available — raw headlines below:_")
+            for item in headlines:
+                pub = f" — _{item['publisher']}_" if item["publisher"] else ""
+                lines.append(f"- [{item['headline']}]({item['link']}){pub}")
+        else:
+            lines.append("_No relevant news found for this move._")
         lines.append("")
 
     lines.append("---")
-    lines.append(
-        "_Headlines are keyword-matched to the ticker, not verified causes. "
-        "A story appearing next to a move is correlation, nothing more._"
-    )
+    if used_synthesis:
+        lines.append(
+            "_Explanations are generated from headlines, not verified against "
+            "primary sources (filings, transcripts). Check the sources before "
+            "trading on them._"
+        )
+    else:
+        lines.append(
+            "_Headlines are keyword-matched to the ticker, not verified causes. "
+            "A story appearing next to a move is correlation, nothing more._"
+        )
     return "\n".join(lines)
 
 

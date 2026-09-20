@@ -24,6 +24,7 @@ import csv
 import os
 import re
 import sys
+import time
 import datetime as dt
 from urllib.parse import quote_plus
 
@@ -229,12 +230,20 @@ suggests". Do not invent anything the headlines do not support: if they do not \
 clearly explain a move of this size, reply with exactly {NO_CLEAR_REASON} and \
 nothing else. Output only the explanation, no preamble."""
 
-    try:
-        resp = client.models.generate_content(model=model, contents=prompt)
-        text = (resp.text or "").strip()
-    except Exception as e:  # noqa: BLE001 - never let summarization kill the run
-        print(f"  ! summary failed for {ticker}: {e}", file=sys.stderr)
-        return None
+    text = ""
+    # The free tier returns a transient 503 under load often enough to be worth
+    # one retry.
+    for attempt in range(2):
+        try:
+            resp = client.models.generate_content(model=model, contents=prompt)
+            text = (resp.text or "").strip()
+            break
+        except Exception as e:  # noqa: BLE001 - never let summarization kill the run
+            print(f"  ! summary failed for {ticker}: {e}", file=sys.stderr)
+            if attempt == 0:
+                time.sleep(3)
+            else:
+                return None
 
     if not text or NO_CLEAR_REASON in text:
         return None

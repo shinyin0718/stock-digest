@@ -1,0 +1,28 @@
+name: Daily digest
+
+on:
+  schedule:
+    # 23:00 UTC Sun-Thu = 07:00 Malaysia time (MYT = UTC+8, no daylight saving)
+    # Mon-Fri. GitHub Actions cron is best-effort and can be delayed by a few
+    # minutes (occasionally longer) when the runner queue is busy.
+    - cron: "0 23 * * 0-4"
+  workflow_dispatch:
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Send digest
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python daily_digest.py

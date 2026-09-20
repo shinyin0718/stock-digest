@@ -29,4 +29,4 @@ jobs:
         run: python daily_digest.py
 
       - name: Show delivered message (temporary, test run only)
-        run: cat digests/*.md
+        run: cat digests/$(date -u +%Y-%m-%d).md

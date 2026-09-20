@@ -39,7 +39,7 @@ OUTPUT_DIR = "digests"
 HEADLINES_PER_NAME = 4
 NEWS_WINDOW_DAYS = 2
 
-GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 # What the model replies with when the headlines don't explain the move.
 NO_CLEAR_REASON = "NO_CLEAR_REASON"
 FALLBACK_REASON = "No specific news found — may be general market movement."
@@ -174,7 +174,31 @@ def gemini_client():
         return None
 
 
-def summarize_reason(ticker, name, pct, headlines, client=None):
+def pick_model(client, preferred=GEMINI_MODEL):
+    """
+    Return a usable model name. Google retires model names periodically, so
+    fall back to the cheapest ('flash') model the key can actually see rather
+    than losing every summary to a 404.
+    """
+    try:
+        names = [
+            m.name.split("/")[-1]
+            for m in client.models.list()
+            if "generateContent" in (getattr(m, "supported_actions", None) or [])
+        ]
+    except Exception as e:  # noqa: BLE001 - never let discovery kill the run
+        print(f"  ! could not list Gemini models: {e}", file=sys.stderr)
+        return preferred
+
+    if preferred in names or not names:
+        return preferred
+    flash = [n for n in names if "flash" in n]
+    chosen = sorted(flash or names, reverse=True)[0]
+    print(f"  ! {preferred} unavailable; using {chosen}", file=sys.stderr)
+    return chosen
+
+
+def summarize_reason(ticker, name, pct, headlines, client=None, model=GEMINI_MODEL):
     """
     Ask Gemini for 1-2 plain-language sentences on why the stock likely moved,
     based only on the supplied headlines. Returns None when no summary can be
@@ -206,7 +230,7 @@ clearly explain a move of this size, reply with exactly {NO_CLEAR_REASON} and \
 nothing else. Output only the explanation, no preamble."""
 
     try:
-        resp = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+        resp = client.models.generate_content(model=model, contents=prompt)
         text = (resp.text or "").strip()
     except Exception as e:  # noqa: BLE001 - never let summarization kill the run
         print(f"  ! summary failed for {ticker}: {e}", file=sys.stderr)
@@ -219,11 +243,17 @@ nothing else. Output only the explanation, no preamble."""
 
 def collect_reasons(movers, names, client=None):
     """Return {ticker: reason or None}, looking up news only for the movers."""
+    model = pick_model(client) if (movers and client is not None) else GEMINI_MODEL
     reasons = {}
     for ticker, p in movers:
         headlines = fetch_news(names.get(ticker, ""), ticker)
         reasons[ticker] = summarize_reason(
-            ticker, names.get(ticker, ""), p["pct"], headlines, client=client
+            ticker,
+            names.get(ticker, ""),
+            p["pct"],
+            headlines,
+            client=client,
+            model=model,
         )
     return reasons
 

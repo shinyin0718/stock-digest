@@ -163,6 +163,9 @@ If nothing arrives, open the run's log and look at the `Send digest` step:
 - `Gemini not configured` / `summary failed` → the `GEMINI_API_KEY` secret is
   missing or the free-tier quota ran out. The message is still sent; only the
   reason lines are affected.
+- `... unavailable; using ...` → Google retired the model the script asks for
+  and it picked another one automatically. To pin a specific model, add a
+  `GEMINI_MODEL` repository secret (or env var) with the model name.
 
 ---
 

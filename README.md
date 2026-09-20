@@ -5,8 +5,34 @@ Telegram message at **7:00 AM Malaysia time, Monday to Friday**.
 
 The message has two parts:
 
-1. **Big movers** — anything that moved 2% or more (up or down).
+1. **Big movers** — anything that moved 2% or more (up or down), each with a
+   one-line plain-language reason worked out from recent news headlines.
 2. **Full watchlist** — every ticker with its % change and price.
+
+It looks like this:
+
+```
+📈 Daily Movers — Fri 18 Sep 2026
+Last completed trading day's close-to-close move.
+
+🔴 TSLA -3.2% ($364.27)
+Reason: Tesla fell after it delivered fewer cars than expected last quarter.
+
+🟢 AAPL +2.5% ($336.13)
+Reason: Apple rose after a strong iPhone launch weekend.
+
+— No major news found for: QQQ
+
+Full watchlist
+Ticker     Change       Price
+-----------------------------
+AAPL       +2.50%      336.13
+...
+```
+
+News is only looked up for the big movers, never for the whole list. If no
+headline explains a move, the line says *"No specific news found — may be
+general market movement."* rather than guessing a reason.
 
 Because the message arrives before the US market opens, the "% change" is the
 move on the **last completed trading day** (its closing price vs. the closing
@@ -50,6 +76,9 @@ MOVE_THRESHOLD = 2.0
 `2.0` means "flag anything that moved 2% or more". Set it to `1.5` to be more
 sensitive, or `3.0` to see fewer names. Commit the change.
 
+This threshold also decides which tickers get a news summary — only the flagged
+movers do.
+
 ## 3. Change the time it's sent
 
 Open `.github/workflows/daily-digest.yml` and edit this line:
@@ -91,6 +120,28 @@ Both secrets are already set up.
 
 ---
 
+## How the news summaries work
+
+Headlines come from Google News' free RSS feed (no account, no key). Turning
+them into one plain sentence is done by **Google Gemini**, on its free tier.
+
+The summaries are a bonus, never a blocker: if the Gemini key is missing,
+out of quota, or the service is down, the digest still goes out on time with
+the price table — those movers just show the "no specific news found" line.
+
+### Getting a free Gemini key (already done)
+
+1. Go to [Google AI Studio](https://aistudio.google.com/apikey) and sign in
+   with a Google account.
+2. Click **Create API key** and copy the key.
+3. In the repo: **Settings** → **Secrets and variables** → **Actions** →
+   **New repository secret**.
+4. Name: `GEMINI_API_KEY`, Secret: the key you copied. Click **Add secret**.
+
+The key is already stored as the `GEMINI_API_KEY` secret.
+
+---
+
 ## Send yourself a test message right now
 
 1. Go to the **Actions** tab at the top of the repo.
@@ -109,6 +160,9 @@ If nothing arrives, open the run's log and look at the `Send digest` step:
   sent the bot a message first.
 - `Watchlist file not found` / `No tickers found` → check `watchlist.csv` still
   has the `ticker` header and at least one ticker.
+- `Gemini not configured` / `summary failed` → the `GEMINI_API_KEY` secret is
+  missing or the free-tier quota ran out. The message is still sent; only the
+  reason lines are affected.
 
 ---
 
@@ -118,6 +172,7 @@ If nothing arrives, open the run's log and look at the `Send digest` step:
 pip install -r requirements.txt
 export TELEGRAM_TOKEN=123456789:AAH...
 export TELEGRAM_CHAT_ID=1506040458
+export GEMINI_API_KEY=...      # optional; without it you just get prices
 python daily_digest.py
 ```
 

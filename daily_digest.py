@@ -1,25 +1,33 @@
 #!/usr/bin/env python3
 """
-Daily stock/ETF digest (Phase 1).
+Daily stock/ETF digest.
 
 Reads a watchlist from watchlist.csv, pulls the most recent completed trading
-day's close-to-close move for each ticker, and sends a short Telegram message:
-the big movers first, then a table of every ticker with its % change and
-current price.
+day's close-to-close move for each ticker, and sends a Telegram message: the
+big movers with a one-line plain-language reason each, then a table of every
+ticker with its % change and price.
 
-Stack: yfinance (prices, free) + Telegram Bot API (delivery, free).
+Stack: yfinance (prices, free) + Google News RSS (headlines, free, no key) +
+Google Gemini (summaries, free tier) + Telegram Bot API (delivery, free).
+
+News and summaries are best-effort: if headlines or Gemini are unavailable the
+price digest is still built and sent.
 
     pip install -r requirements.txt
     export TELEGRAM_TOKEN=...
     export TELEGRAM_CHAT_ID=...
+    export GEMINI_API_KEY=...        # optional
     python daily_digest.py
 """
 
 import csv
 import os
+import re
 import sys
 import datetime as dt
+from urllib.parse import quote_plus
 
+import feedparser
 import pandas as pd
 import requests
 import yfinance as yf
@@ -28,11 +36,19 @@ from config import MOVE_THRESHOLD, WATCHLIST_FILE
 
 OUTPUT_DIR = "digests"
 
+HEADLINES_PER_NAME = 4
+NEWS_WINDOW_DAYS = 2
+
+GEMINI_MODEL = "gemini-2.0-flash"
+# What the model replies with when the headlines don't explain the move.
+NO_CLEAR_REASON = "NO_CLEAR_REASON"
+FALLBACK_REASON = "No specific news found — may be general market movement."
+
 # ------------------------------------------------------------ watchlist ----
 
 
 def load_watchlist(path=None):
-    """Return the list of tickers from the CSV. Raises on missing/empty file."""
+    """Return {ticker: name} from the CSV. Raises on missing/empty file."""
     path = path or os.path.join(os.path.dirname(os.path.abspath(__file__)), WATCHLIST_FILE)
     if not os.path.exists(path):
         raise SystemExit(
@@ -40,7 +56,7 @@ def load_watchlist(path=None):
             "Create it with a header line 'ticker,name' and one ticker per line."
         )
 
-    tickers = []
+    tickers = {}
     with open(path, newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         if not reader.fieldnames or "ticker" not in [
@@ -50,10 +66,13 @@ def load_watchlist(path=None):
                 f"{path} must have a header row containing a 'ticker' column."
             )
         key = next(c for c in reader.fieldnames if (c or "").strip().lower() == "ticker")
+        name_key = next(
+            (c for c in reader.fieldnames if (c or "").strip().lower() == "name"), None
+        )
         for row in reader:
             ticker = (row.get(key) or "").strip().upper()
             if ticker and not ticker.startswith("#"):
-                tickers.append(ticker)
+                tickers[ticker] = (row.get(name_key) or "").strip() if name_key else ""
 
     if not tickers:
         raise SystemExit(f"No tickers found in {path}. Add at least one ticker.")
@@ -102,30 +121,156 @@ def fetch_prices(tickers):
     return out
 
 
+# ----------------------------------------------------------------- news -----
+
+
+def fetch_news(name, ticker, limit=HEADLINES_PER_NAME):
+    """Recent headlines from Google News RSS. No key needed; never raises."""
+    query = f'"{name or ticker}" OR {ticker} stock when:{NEWS_WINDOW_DAYS}d'
+    url = (
+        "https://news.google.com/rss/search?"
+        f"q={quote_plus(query)}&hl=en-US&gl=US&ceid=US:en"
+    )
+    try:
+        feed = feedparser.parse(url)
+    except Exception as e:  # noqa: BLE001 - never let news kill the run
+        print(f"  ! news fetch failed for {ticker}: {e}", file=sys.stderr)
+        return []
+
+    items = []
+    seen = set()
+    for entry in feed.entries:
+        title = entry.get("title", "").strip()
+        # Google appends " - Publisher" to titles
+        headline, _, publisher = title.rpartition(" - ")
+        headline = headline or title
+        key = headline.lower()[:60]
+        if not headline or key in seen:
+            continue
+        seen.add(key)
+        items.append({"headline": headline, "publisher": publisher})
+        if len(items) >= limit:
+            break
+    return items
+
+
+# ------------------------------------------------------------ summaries ----
+
+
+def gemini_client():
+    """Return a Gemini client, or None if the key or SDK is unavailable."""
+    key = os.environ.get("GEMINI_API_KEY")
+    if not key:
+        return None
+    try:
+        from google import genai
+    except ImportError as e:
+        print(f"  ! Gemini SDK unavailable: {e}", file=sys.stderr)
+        return None
+    try:
+        return genai.Client(api_key=key)
+    except Exception as e:  # noqa: BLE001 - never let the client kill the run
+        print(f"  ! Gemini client failed: {e}", file=sys.stderr)
+        return None
+
+
+def summarize_reason(ticker, name, pct, headlines, client=None):
+    """
+    Ask Gemini for 1-2 plain-language sentences on why the stock likely moved,
+    based only on the supplied headlines. Returns None when no summary can be
+    produced (no client, no headlines, API error, or the headlines don't
+    explain the move) so the caller can fall back instead of guessing.
+    """
+    if client is None or not headlines:
+        return None
+
+    headline_lines = "\n".join(
+        f"- {h['headline']} ({h['publisher'] or 'unknown source'})" for h in headlines
+    )
+
+    prompt = f"""A stock moved on the last completed trading day. Here is the data and recent headlines mentioning it.
+
+Ticker: {ticker} ({name or ticker})
+Move: {pct:+.2f}%
+
+Recent headlines:
+{headline_lines}
+
+Write 1-2 sentences a reader with no finance background can understand, \
+explaining the likely reason for this move based only on the headlines above. \
+Be concrete (name the actual event - earnings, guidance, an analyst call, \
+product news, a macro or sector move) rather than generic, and use plain \
+language with no jargon. Do not use hedging filler like "it appears" or "this \
+suggests". Do not invent anything the headlines do not support: if they do not \
+clearly explain a move of this size, reply with exactly {NO_CLEAR_REASON} and \
+nothing else. Output only the explanation, no preamble."""
+
+    try:
+        resp = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+        text = (resp.text or "").strip()
+    except Exception as e:  # noqa: BLE001 - never let summarization kill the run
+        print(f"  ! summary failed for {ticker}: {e}", file=sys.stderr)
+        return None
+
+    if not text or NO_CLEAR_REASON in text:
+        return None
+    return " ".join(text.split())
+
+
+def collect_reasons(movers, names, client=None):
+    """Return {ticker: reason or None}, looking up news only for the movers."""
+    reasons = {}
+    for ticker, p in movers:
+        headlines = fetch_news(names.get(ticker, ""), ticker)
+        reasons[ticker] = summarize_reason(
+            ticker, names.get(ticker, ""), p["pct"], headlines, client=client
+        )
+    return reasons
+
+
 # --------------------------------------------------------------- report -----
 
 
-def build_report(prices, threshold=MOVE_THRESHOLD):
-    """Telegram-friendly message: movers first, then a monospace table."""
+def _plain(text):
+    """Drop characters Telegram's legacy Markdown would try to interpret."""
+    return re.sub(r"[*_`\[\]]", "", text)
+
+
+def build_report(prices, reasons=None, threshold=MOVE_THRESHOLD):
+    """Telegram-friendly message: movers with reasons, then a monospace table."""
+    reasons = reasons or {}
     date = next(iter(prices.values()))["date"] if prices else dt.date.today()
 
     lines = [
-        f"*Market digest — {date:%a %d %b %Y}*",
+        f"📈 *Daily Movers — {date:%a %d %b %Y}*",
         "Last completed trading day's close-to-close move.",
         "",
     ]
 
     ranked = sorted(prices.items(), key=lambda kv: kv[1]["pct"], reverse=True)
-    movers = [(t, p) for t, p in ranked if abs(p["pct"]) >= threshold]
+    movers = sorted(
+        (kv for kv in ranked if abs(kv[1]["pct"]) >= threshold),
+        key=lambda kv: abs(kv[1]["pct"]),
+        reverse=True,
+    )
 
-    lines.append(f"*Big movers (>= {threshold:g}%)*")
     if movers:
+        no_news = []
         for t, p in movers:
-            arrow = "▲" if p["pct"] > 0 else "▼"
-            lines.append(f"{arrow} {t}  {p['pct']:+.2f}%  ({p['close']:,.2f})")
+            dot = "🟢" if p["pct"] > 0 else "🔴"
+            lines.append(f"{dot} *{t}* {p['pct']:+.1f}% (${p['close']:,.2f})")
+            reason = reasons.get(t)
+            if not reason:
+                reason = FALLBACK_REASON
+                no_news.append(t)
+            lines.append(f"Reason: {_plain(reason)}")
+            lines.append("")
+        if no_news:
+            lines.append(f"— No major news found for: {', '.join(no_news)}")
+            lines.append("")
     else:
         lines.append(f"Quiet day — no movers >= {threshold:g}%.")
-    lines.append("")
+        lines.append("")
 
     # Telegram does not render Markdown tables, so use a fixed-width code block.
     table = [f"{'Ticker':<8}{'Change':>9}{'Price':>12}", "-" * 29]
@@ -182,7 +327,8 @@ def send_telegram(text):
 
 
 def main():
-    tickers = load_watchlist()
+    watchlist = load_watchlist()
+    tickers = list(watchlist)
     print(f"Fetching prices for {len(tickers)} tickers...")
     prices = fetch_prices(tickers)
 
@@ -190,8 +336,16 @@ def main():
         print("No price data returned.", file=sys.stderr)
         return 1
 
+    movers = [(t, p) for t, p in prices.items() if abs(p["pct"]) >= MOVE_THRESHOLD]
+    print(f"{len(movers)} mover(s) at or above {MOVE_THRESHOLD:g}%.")
+
+    client = gemini_client()
+    if movers and client is None:
+        print("Gemini not configured (GEMINI_API_KEY); using fallback reasons.")
+    reasons = collect_reasons(movers, watchlist, client=client)
+
     print("Building report...")
-    report = build_report(prices)
+    report = build_report(prices, reasons)
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     path = os.path.join(OUTPUT_DIR, f"{dt.date.today():%Y-%m-%d}.md")

@@ -1,66 +1,76 @@
 #!/usr/bin/env python3
 """
-Daily stock/ETF digest.
+Daily stock/ETF digest (Phase 1).
 
-Pulls yesterday's close-to-close move for a watchlist, works out which moves
-are actually idiosyncratic (vs. the whole market moving), and uses Claude to
-turn the raw headlines into one plain-English explanation per notable move.
+Reads a watchlist from watchlist.csv, pulls the most recent completed trading
+day's close-to-close move for each ticker, and sends a short Telegram message:
+the big movers first, then a table of every ticker with its % change and
+current price.
 
-Stack: yfinance (prices, free) + Google News RSS (headlines, free) +
-Anthropic API (synthesis, ~$0.01-0.05/month for a ~10-ticker watchlist on
-Haiku). Set ANTHROPIC_API_KEY to enable synthesis; without it, the script
-falls back to listing raw headlines.
+Stack: yfinance (prices, free) + Telegram Bot API (delivery, free).
 
-    pip install yfinance feedparser requests pandas anthropic
-    export ANTHROPIC_API_KEY=sk-ant-...
+    pip install -r requirements.txt
+    export TELEGRAM_TOKEN=...
+    export TELEGRAM_CHAT_ID=...
     python daily_digest.py
 """
 
+import csv
 import os
 import sys
 import datetime as dt
-from urllib.parse import quote_plus
 
-import feedparser
 import pandas as pd
 import requests
 import yfinance as yf
 
-try:
-    import anthropic
-except ImportError:
-    anthropic = None
-
-# ---------------------------------------------------------------- config ----
-
-# ticker -> name used to search for news
-WATCHLIST = {
-    "AAPL": "Apple",
-    "MSFT": "Microsoft",
-    "NVDA": "Nvidia",
-    "TSM": "TSMC",
-    "VOO": "Vanguard S&P 500 ETF",
-    "QQQ": "Invesco QQQ",
-    "IWM": "iShares Russell 2000",
-    "GLD": "SPDR Gold Shares",
-}
-
-BENCHMARK = "SPY"          # used to separate market-wide moves from stock-specific ones
-MOVE_THRESHOLD = 2.0       # abs % move that makes a name "notable"
-RELATIVE_THRESHOLD = 1.5   # abs % move vs benchmark that makes it idiosyncratic
-HEADLINES_PER_NAME = 4
-NEWS_WINDOW_DAYS = 2
+from config import MOVE_THRESHOLD, WATCHLIST_FILE
 
 OUTPUT_DIR = "digests"
 
-SYNTHESIS_MODEL = "claude-haiku-4-5-20251001"
-_client = anthropic.Anthropic() if (anthropic and os.environ.get("ANTHROPIC_API_KEY")) else None
+# ------------------------------------------------------------ watchlist ----
+
+
+def load_watchlist(path=None):
+    """Return the list of tickers from the CSV. Raises on missing/empty file."""
+    path = path or os.path.join(os.path.dirname(os.path.abspath(__file__)), WATCHLIST_FILE)
+    if not os.path.exists(path):
+        raise SystemExit(
+            f"Watchlist file not found: {path}\n"
+            "Create it with a header line 'ticker,name' and one ticker per line."
+        )
+
+    tickers = []
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames or "ticker" not in [
+            (c or "").strip().lower() for c in reader.fieldnames
+        ]:
+            raise SystemExit(
+                f"{path} must have a header row containing a 'ticker' column."
+            )
+        key = next(c for c in reader.fieldnames if (c or "").strip().lower() == "ticker")
+        for row in reader:
+            ticker = (row.get(key) or "").strip().upper()
+            if ticker and not ticker.startswith("#"):
+                tickers.append(ticker)
+
+    if not tickers:
+        raise SystemExit(f"No tickers found in {path}. Add at least one ticker.")
+    return tickers
+
 
 # --------------------------------------------------------------- prices -----
 
 
 def fetch_prices(tickers):
-    """Return {ticker: {'close', 'prev_close', 'pct', 'volume', 'avg_volume'}}."""
+    """
+    Return {ticker: {'date', 'close', 'prev_close', 'pct'}}.
+
+    The digest is sent pre-market (7 AM Malaysia time), so there is no live
+    price to report. 'close' is the last completed trading day's closing price
+    and 'pct' is that day's close-to-close change vs the day before it.
+    """
     data = yf.download(
         tickers,
         period="1mo",
@@ -77,198 +87,56 @@ def fetch_prices(tickers):
             df = data[t] if isinstance(data.columns, pd.MultiIndex) else data
             df = df.dropna(subset=["Close"])
             if len(df) < 2:
+                print(f"  ! not enough price history for {t}", file=sys.stderr)
                 continue
             close = float(df["Close"].iloc[-1])
             prev = float(df["Close"].iloc[-2])
-            vol = float(df["Volume"].iloc[-1])
-            avg_vol = float(df["Volume"].tail(20).mean())
             out[t] = {
                 "date": df.index[-1].date(),
                 "close": close,
                 "prev_close": prev,
                 "pct": (close / prev - 1) * 100,
-                "volume": vol,
-                "avg_volume": avg_vol,
-                "vol_ratio": vol / avg_vol if avg_vol else float("nan"),
             }
         except (KeyError, IndexError, ValueError) as e:
             print(f"  ! price fetch failed for {t}: {e}", file=sys.stderr)
     return out
 
 
-# ----------------------------------------------------------------- news -----
-
-
-def fetch_news(name, ticker, limit=HEADLINES_PER_NAME):
-    """Recent headlines from Google News RSS. No key, no rate limit in practice."""
-    query = f'"{name}" OR {ticker} stock when:{NEWS_WINDOW_DAYS}d'
-    url = (
-        "https://news.google.com/rss/search?"
-        f"q={quote_plus(query)}&hl=en-US&gl=US&ceid=US:en"
-    )
-    try:
-        feed = feedparser.parse(url)
-    except Exception as e:  # noqa: BLE001 - never let news kill the run
-        print(f"  ! news fetch failed for {ticker}: {e}", file=sys.stderr)
-        return []
-
-    items = []
-    seen = set()
-    for entry in feed.entries:
-        title = entry.get("title", "").strip()
-        # Google appends " - Publisher" to titles
-        headline, _, publisher = title.rpartition(" - ")
-        headline = headline or title
-        key = headline.lower()[:60]
-        if key in seen:
-            continue
-        seen.add(key)
-        items.append(
-            {
-                "headline": headline,
-                "publisher": publisher,
-                "link": entry.get("link", ""),
-            }
-        )
-        if len(items) >= limit:
-            break
-    return items
-
-
-# ------------------------------------------------------------ synthesis ----
-
-
-def synthesize_explanation(ticker, name, pct, rel, vol_ratio, headlines):
-    """
-    Ask Claude to turn raw headlines into 1-2 plain-English sentences on why
-    the stock likely moved. Returns None if synthesis isn't available or the
-    headlines don't actually support a confident explanation - callers should
-    fall back to listing raw headlines in that case.
-    """
-    if not _client or not headlines:
-        return None
-
-    headline_lines = "\n".join(
-        f"- {h['headline']} ({h['publisher'] or 'unknown source'})" for h in headlines
-    )
-    driver = "roughly in line with the overall market" if abs(rel) < RELATIVE_THRESHOLD else "moving independently of the market"
-
-    prompt = f"""A stock moved today. Here is the data and recent headlines mentioning it.
-
-Ticker: {ticker} ({name})
-Move: {pct:+.2f}% ({driver}, {rel:+.2f}pp vs S&P 500)
-Volume: {vol_ratio:.1f}x the 20-day average
-
-Recent headlines:
-{headline_lines}
-
-Write 1-2 sentences a reader can understand without clicking through, explaining \
-the likely reason for this move based on the headlines above. Be concrete (name \
-the actual event - earnings, guidance, an analyst call, a product news, a \
-macro/sector move, etc.) rather than generic. If the headlines don't clearly \
-explain a move of this size, say so plainly instead of guessing - do not invent \
-a reason that isn't supported by the headlines. Do not use hedging filler like \
-"it appears" or "this suggests." Output only the explanation, no preamble."""
-
-    try:
-        resp = _client.messages.create(
-            model=SYNTHESIS_MODEL,
-            max_tokens=150,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        text = "".join(b.text for b in resp.content if b.type == "text").strip()
-        return text or None
-    except Exception as e:  # noqa: BLE001 - never let synthesis kill the run
-        print(f"  ! synthesis failed for {ticker}: {e}", file=sys.stderr)
-        return None
-
-
 # --------------------------------------------------------------- report -----
 
 
-def build_report(prices, bench_pct):
-    lines = []
+def build_report(prices, threshold=MOVE_THRESHOLD):
+    """Telegram-friendly message: movers first, then a monospace table."""
     date = next(iter(prices.values()))["date"] if prices else dt.date.today()
 
-    lines.append(f"# Market digest — {date:%a %d %b %Y}")
-    lines.append("")
-    lines.append(f"**{BENCHMARK} {bench_pct:+.2f}%** — everything below is relative to that.")
-    lines.append("")
-
-    ranked = sorted(prices.items(), key=lambda kv: kv[1]["pct"], reverse=True)
-
-    # Full table first, so you can always see the whole watchlist at a glance.
-    lines.append("| Ticker | Close | Day | vs SPY | Vol |")
-    lines.append("|---|---|---|---|---|")
-    for t, p in ranked:
-        rel = p["pct"] - bench_pct
-        vol_flag = "🔺" if p["vol_ratio"] > 1.5 else ""
-        lines.append(
-            f"| {t} | {p['close']:,.2f} | {p['pct']:+.2f}% | "
-            f"{rel:+.2f}% | {p['vol_ratio']:.1f}x {vol_flag} |"
-        )
-    lines.append("")
-
-    # Then the "why" section, only for names that actually did something.
-    notable = [
-        (t, p)
-        for t, p in ranked
-        if abs(p["pct"]) >= MOVE_THRESHOLD
-        or abs(p["pct"] - bench_pct) >= RELATIVE_THRESHOLD
+    lines = [
+        f"*Market digest — {date:%a %d %b %Y}*",
+        "Last completed trading day's close-to-close move.",
+        "",
     ]
 
-    if not notable:
-        lines.append("_Quiet day — nothing moved enough to look into._")
-        return "\n".join(lines)
+    ranked = sorted(prices.items(), key=lambda kv: kv[1]["pct"], reverse=True)
+    movers = [(t, p) for t, p in ranked if abs(p["pct"]) >= threshold]
 
-    lines.append("## What moved")
-    lines.append("")
-    used_synthesis = False
-    for t, p in notable:
-        rel = p["pct"] - bench_pct
-        driver = "market-wide" if abs(rel) < RELATIVE_THRESHOLD else "stock-specific"
-        lines.append(f"### {t} {p['pct']:+.2f}% ({rel:+.2f}% vs SPY — likely {driver})")
-        if p["vol_ratio"] > 1.5:
-            lines.append(f"Volume {p['vol_ratio']:.1f}x the 20-day average.")
-        lines.append("")
-
-        headlines = fetch_news(WATCHLIST.get(t, t), t)
-        explanation = synthesize_explanation(
-            t, WATCHLIST.get(t, t), p["pct"], rel, p["vol_ratio"], headlines
-        )
-
-        if explanation:
-            used_synthesis = True
-            lines.append(explanation)
-            lines.append("")
-            lines.append("<details><summary>Sources</summary>")
-            lines.append("")
-            for item in headlines:
-                pub = f" — _{item['publisher']}_" if item["publisher"] else ""
-                lines.append(f"- [{item['headline']}]({item['link']}){pub}")
-            lines.append("")
-            lines.append("</details>")
-        elif headlines:
-            lines.append("_No synthesized explanation available — raw headlines below:_")
-            for item in headlines:
-                pub = f" — _{item['publisher']}_" if item["publisher"] else ""
-                lines.append(f"- [{item['headline']}]({item['link']}){pub}")
-        else:
-            lines.append("_No relevant news found for this move._")
-        lines.append("")
-
-    lines.append("---")
-    if used_synthesis:
-        lines.append(
-            "_Explanations are generated from headlines, not verified against "
-            "primary sources (filings, transcripts). Check the sources before "
-            "trading on them._"
-        )
+    lines.append(f"*Big movers (>= {threshold:g}%)*")
+    if movers:
+        for t, p in movers:
+            arrow = "▲" if p["pct"] > 0 else "▼"
+            lines.append(f"{arrow} {t}  {p['pct']:+.2f}%  ({p['close']:,.2f})")
     else:
-        lines.append(
-            "_Headlines are keyword-matched to the ticker, not verified causes. "
-            "A story appearing next to a move is correlation, nothing more._"
-        )
+        lines.append(f"Quiet day — no movers >= {threshold:g}%.")
+    lines.append("")
+
+    # Telegram does not render Markdown tables, so use a fixed-width code block.
+    table = [f"{'Ticker':<8}{'Change':>9}{'Price':>12}", "-" * 29]
+    for t, p in ranked:
+        table.append(f"{t:<8}{p['pct']:>+8.2f}%{p['close']:>12,.2f}")
+
+    lines.append("*Full watchlist*")
+    lines.append("```")
+    lines.extend(table)
+    lines.append("```")
+
     return "\n".join(lines)
 
 
@@ -314,21 +182,16 @@ def send_telegram(text):
 
 
 def main():
-    tickers = list(WATCHLIST) + [BENCHMARK]
+    tickers = load_watchlist()
     print(f"Fetching prices for {len(tickers)} tickers...")
     prices = fetch_prices(tickers)
-
-    if BENCHMARK not in prices:
-        print("Could not fetch benchmark; aborting.", file=sys.stderr)
-        return 1
-    bench_pct = prices.pop(BENCHMARK)["pct"]
 
     if not prices:
         print("No price data returned.", file=sys.stderr)
         return 1
 
     print("Building report...")
-    report = build_report(prices, bench_pct)
+    report = build_report(prices)
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     path = os.path.join(OUTPUT_DIR, f"{dt.date.today():%Y-%m-%d}.md")
@@ -338,6 +201,8 @@ def main():
 
     if send_telegram(report):
         print("Sent to Telegram.")
+    else:
+        print("Telegram not configured (TELEGRAM_TOKEN / TELEGRAM_CHAT_ID).")
 
     return 0
 

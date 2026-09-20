@@ -27,3 +27,6 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python daily_digest.py
+
+      - name: Show delivered message (temporary, test run only)
+        run: cat digests/*.md

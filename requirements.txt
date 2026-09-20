@@ -2,3 +2,6 @@
 yfinance==1.7.0
 pandas==2.3.3
 requests==2.34.2
+feedparser==6.0.14
+# Google's current Gemini SDK; the older google-generativeai package is retired.
+google-genai==2.24.0

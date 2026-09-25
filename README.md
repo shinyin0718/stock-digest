@@ -32,7 +32,10 @@ AAPL       +2.50%      336.13
 
 News is only looked up for the big movers, never for the whole list. If no
 headline explains a move, the line says *"No specific news found — may be
-general market movement."* rather than guessing a reason.
+general market movement."* rather than guessing a reason. The same line appears
+if Gemini's free tier is busy ("high demand"): the script retries a few times
+and tries a second Gemini model before giving up, but the price alert is never
+delayed or blocked by it.
 
 Because the message arrives before the US market opens, the "% change" is the
 move on the **last completed trading day** (its closing price vs. the closing

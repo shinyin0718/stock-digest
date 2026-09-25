@@ -175,11 +175,16 @@ def gemini_client():
         return None
 
 
-def pick_model(client, preferred=GEMINI_MODEL):
+RETRY_DELAYS = (3, 10, 20)  # seconds between attempts on the same model
+MAX_MODELS = 2  # preferred model plus one fallback
+
+
+def pick_models(client, preferred=GEMINI_MODEL):
     """
-    Return a usable model name. Google retires model names periodically, so
-    fall back to the cheapest ('flash') model the key can actually see rather
-    than losing every summary to a 404.
+    Return an ordered list of model names to try. Google retires model names
+    periodically and the free tier of any single model can be saturated
+    (503 'high demand'), so the preferred model is followed by the newest
+    other 'flash' models the key can see.
     """
     try:
         names = [
@@ -189,17 +194,16 @@ def pick_model(client, preferred=GEMINI_MODEL):
         ]
     except Exception as e:  # noqa: BLE001 - never let discovery kill the run
         print(f"  ! could not list Gemini models: {e}", file=sys.stderr)
-        return preferred
+        return [preferred]
 
+    flash = sorted((n for n in names if "flash" in n and n != preferred), reverse=True)
     if preferred in names or not names:
-        return preferred
-    flash = [n for n in names if "flash" in n]
-    chosen = sorted(flash or names, reverse=True)[0]
-    print(f"  ! {preferred} unavailable; using {chosen}", file=sys.stderr)
-    return chosen
+        return [preferred] + flash[: MAX_MODELS - 1]
+    print(f"  ! {preferred} unavailable; using {flash[0] if flash else names[0]}", file=sys.stderr)
+    return (flash or sorted(names, reverse=True))[:MAX_MODELS]
 
 
-def summarize_reason(ticker, name, pct, headlines, client=None, model=GEMINI_MODEL):
+def summarize_reason(ticker, name, pct, headlines, client=None, models=(GEMINI_MODEL,)):
     """
     Ask Gemini for 1-2 plain-language sentences on why the stock likely moved,
     based only on the supplied headlines. Returns None when no summary can be
@@ -230,20 +234,21 @@ suggests". Do not invent anything the headlines do not support: if they do not \
 clearly explain a move of this size, reply with exactly {NO_CLEAR_REASON} and \
 nothing else. Output only the explanation, no preamble."""
 
-    text = ""
-    # The free tier returns a transient 503 under load often enough to be worth
-    # one retry.
-    for attempt in range(2):
-        try:
-            resp = client.models.generate_content(model=model, contents=prompt)
-            text = (resp.text or "").strip()
+    text = None
+    for model in models:
+        for attempt, delay in enumerate(RETRY_DELAYS):
+            try:
+                resp = client.models.generate_content(model=model, contents=prompt)
+                text = (resp.text or "").strip()
+                break
+            except Exception as e:  # noqa: BLE001 - never let summarization kill the run
+                print(f"  ! summary failed for {ticker} ({model}, try {attempt + 1}): {e}", file=sys.stderr)
+                if attempt < len(RETRY_DELAYS) - 1:
+                    time.sleep(delay)
+        if text is not None:
             break
-        except Exception as e:  # noqa: BLE001 - never let summarization kill the run
-            print(f"  ! summary failed for {ticker}: {e}", file=sys.stderr)
-            if attempt == 0:
-                time.sleep(3)
-            else:
-                return None
+    if text is None:
+        return None
 
     if not text or NO_CLEAR_REASON in text:
         return None
@@ -252,7 +257,7 @@ nothing else. Output only the explanation, no preamble."""
 
 def collect_reasons(movers, names, client=None):
     """Return {ticker: reason or None}, looking up news only for the movers."""
-    model = pick_model(client) if (movers and client is not None) else GEMINI_MODEL
+    models = pick_models(client) if (movers and client is not None) else [GEMINI_MODEL]
     reasons = {}
     for ticker, p in movers:
         headlines = fetch_news(names.get(ticker, ""), ticker)
@@ -262,7 +267,7 @@ def collect_reasons(movers, names, client=None):
             p["pct"],
             headlines,
             client=client,
-            model=model,
+            models=models,
         )
     return reasons
 

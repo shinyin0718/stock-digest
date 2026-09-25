@@ -177,6 +177,18 @@ def gemini_client():
 
 RETRY_DELAYS = (3, 10, 20)  # seconds between attempts on the same model
 MAX_MODELS = 2  # preferred model plus one fallback
+# Errors worth retrying on the same model: overload / rate limit / timeout.
+TRANSIENT_MARKERS = ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "500", "INTERNAL", "504", "DEADLINE")
+# Errors that mean the key itself is bad: no other model will help either.
+FATAL_MARKERS = ("401", "403", "PERMISSION_DENIED", "UNAUTHENTICATED", "API_KEY_INVALID", "API key")
+
+
+def is_transient(err):
+    return any(m in str(err) for m in TRANSIENT_MARKERS)
+
+
+def is_fatal(err):
+    return any(m in str(err) for m in FATAL_MARKERS)
 
 
 def pick_models(client, preferred=GEMINI_MODEL):
@@ -199,8 +211,9 @@ def pick_models(client, preferred=GEMINI_MODEL):
     flash = sorted((n for n in names if "flash" in n and n != preferred), reverse=True)
     if preferred in names or not names:
         return [preferred] + flash[: MAX_MODELS - 1]
-    print(f"  ! {preferred} unavailable; using {flash[0] if flash else names[0]}", file=sys.stderr)
-    return (flash or sorted(names, reverse=True))[:MAX_MODELS]
+    chosen = (flash or sorted(names, reverse=True))[:MAX_MODELS]
+    print(f"  ! {preferred} unavailable; using {chosen[0]}", file=sys.stderr)
+    return chosen
 
 
 def summarize_reason(ticker, name, pct, headlines, client=None, models=(GEMINI_MODEL,)):
@@ -243,6 +256,10 @@ nothing else. Output only the explanation, no preamble."""
                 break
             except Exception as e:  # noqa: BLE001 - never let summarization kill the run
                 print(f"  ! summary failed for {ticker} ({model}, try {attempt + 1}): {e}", file=sys.stderr)
+                if is_fatal(e):
+                    return None
+                if not is_transient(e):
+                    break  # e.g. 404 model retired: try the next model right away
                 if attempt < len(RETRY_DELAYS) - 1:
                     time.sleep(delay)
         if text is not None:

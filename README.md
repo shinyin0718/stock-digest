@@ -84,13 +84,14 @@ movers do.
 Open `.github/workflows/daily-digest.yml` and edit this line:
 
 ```yaml
-    - cron: "0 23 * * 0-4"
+    - cron: "37 22 * * 0-4"
 ```
 
-Times there are in UTC. Malaysia time is UTC+8, so 07:00 MYT = 23:00 UTC the
+Times there are in UTC. Malaysia time is UTC+8, so 06:37 MYT = 22:37 UTC the
 **previous** day — that's why the schedule says Sunday–Thursday (`0-4`) but you
 receive it Monday–Friday. GitHub's scheduler is best-effort, so the message may
-arrive a few minutes late.
+arrive late — on-the-hour slots often run 1–2 hours behind, which is why the
+schedule uses an odd minute and aims a little before 7:00.
 
 ---
 

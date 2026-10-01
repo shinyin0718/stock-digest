@@ -27,6 +27,7 @@ import sys
 import time
 import datetime as dt
 from urllib.parse import quote_plus
+from zoneinfo import ZoneInfo
 
 import feedparser
 import pandas as pd
@@ -83,13 +84,69 @@ def load_watchlist(path=None):
 # --------------------------------------------------------------- prices -----
 
 
+def previous_weekday(day):
+    day -= dt.timedelta(days=1)
+    while day.weekday() >= 5:
+        day -= dt.timedelta(days=1)
+    return day
+
+
+def last_completed_session(ticker, history):
+    """
+    Return {'date', 'close', 'prev_close'} for the last *completed* session,
+    combining Yahoo's live quote with daily history, or None.
+
+    Yahoo's daily history lags: the just-finished US session is often missing
+    for hours after the close (the digest runs ~9 PM New York time and used to
+    report the previous day), and odd days go missing on LSE. The quote fields
+    (regularMarketPrice / regularMarketPreviousClose) update at the close, so:
+
+    - exchange closed: close = regularMarketPrice, dated regularMarketTime
+    - exchange open (London / Bursa at 7 AM MYT): the live price is intraday,
+      so the completed session is regularMarketPreviousClose, and the close
+      before it comes from history.
+    """
+    try:
+        info = yf.Ticker(ticker).info
+        state = info.get("marketState") or ""
+        ts = info.get("regularMarketTime")
+        price = info.get("regularMarketPrice")
+        prev = info.get("regularMarketPreviousClose")
+        tz = ZoneInfo(info.get("exchangeTimezoneName") or "UTC")
+    except Exception as e:  # noqa: BLE001 - fall back to history on any failure
+        print(f"  ! quote lookup failed for {ticker}: {e}", file=sys.stderr)
+        return None
+    if not (ts and price and prev):
+        return None
+    quote_date = dt.datetime.fromtimestamp(ts, tz).date()
+
+    if state != "REGULAR":
+        return {"date": quote_date, "close": float(price), "prev_close": float(prev)}
+
+    closes = history["Close"].dropna() if history is not None else pd.Series(dtype=float)
+    closes = closes[[d.date() < quote_date for d in closes.index]]
+    if closes.empty:
+        return None
+    last = closes.iloc[-1]
+    if abs(last - float(prev)) < 1e-6:
+        # History already has the completed session; the bar before it is prev.
+        if len(closes) < 2:
+            return None
+        return {"date": closes.index[-1].date(), "close": float(prev), "prev_close": float(closes.iloc[-2])}
+    # History is missing the completed session; its date is the trading day
+    # before the live one (ignoring exchange holidays).
+    return {"date": previous_weekday(quote_date), "close": float(prev), "prev_close": float(last)}
+
+
 def fetch_prices(tickers):
     """
     Return {ticker: {'date', 'close', 'prev_close', 'pct'}}.
 
     The digest is sent pre-market (7 AM Malaysia time), so there is no live
     price to report. 'close' is the last completed trading day's closing price
-    and 'pct' is that day's close-to-close change vs the day before it.
+    and 'pct' is that day's close-to-close change vs the day before it. See
+    last_completed_session() for how the completed session is identified;
+    plain daily history is only used if the quote lookup fails.
     """
     data = yf.download(
         tickers,
@@ -106,6 +163,17 @@ def fetch_prices(tickers):
         try:
             df = data[t] if isinstance(data.columns, pd.MultiIndex) else data
             df = df.dropna(subset=["Close"])
+        except (KeyError, IndexError, ValueError):
+            df = None
+
+        q = last_completed_session(t, df)
+        if q is not None:
+            out[t] = {**q, "pct": (q["close"] / q["prev_close"] - 1) * 100}
+            continue
+
+        try:
+            today = dt.datetime.now(dt.timezone.utc).date()
+            df = df[[d.date() < today for d in df.index]]
             if len(df) < 2:
                 print(f"  ! not enough price history for {t}", file=sys.stderr)
                 continue
@@ -117,7 +185,7 @@ def fetch_prices(tickers):
                 "prev_close": prev,
                 "pct": (close / prev - 1) * 100,
             }
-        except (KeyError, IndexError, ValueError) as e:
+        except (KeyError, IndexError, ValueError, TypeError) as e:
             print(f"  ! price fetch failed for {t}: {e}", file=sys.stderr)
     return out
 

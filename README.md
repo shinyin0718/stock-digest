@@ -39,7 +39,9 @@ delayed or blocked by it.
 
 Because the message arrives before the US market opens, the "% change" is the
 move on the **last completed trading day** (its closing price vs. the closing
-price the day before).
+price the day before). For London- or Malaysia-listed tickers, whose markets
+are already open at 7 AM MYT, that means yesterday's session, so every row in
+the table describes a finished day.
 
 Everything runs for free on GitHub Actions. You don't need to keep your computer
 on.

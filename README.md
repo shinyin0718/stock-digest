@@ -86,17 +86,29 @@ movers do.
 
 ## 3. Change the time it's sent
 
-Open `.github/workflows/daily-digest.yml` and edit this line:
+The digest is triggered by a free account at [cron-job.org](https://cron-job.org),
+which "presses" GitHub's **Run workflow** button at 06:55 Malaysia time every
+weekday. (GitHub's own built-in schedule was tried first, but on the free tier
+it ran 2.5–4 hours late every day.)
 
-```yaml
-    - cron: "37 22 * * 0-4"
-```
+To change the time: log in to cron-job.org → open the **Stock digest** job →
+edit the schedule. Make sure the job's timezone is **Asia/Kuala_Lumpur**.
 
-Times there are in UTC. Malaysia time is UTC+8, so 06:37 MYT = 22:37 UTC the
-**previous** day — that's why the schedule says Sunday–Thursday (`0-4`) but you
-receive it Monday–Friday. GitHub's scheduler is best-effort, so the message may
-arrive late — on-the-hour slots often run 1–2 hours behind, which is why the
-schedule uses an odd minute and aims a little before 7:00.
+If the job ever needs to be re-created, these are the settings:
+
+| Setting | Value |
+| --- | --- |
+| URL | `https://api.github.com/repos/shinyin0718/stock-digest/actions/workflows/daily-digest.yml/dispatches` |
+| Method | `POST` |
+| Body | `{"ref":"main"}` |
+| Header `Authorization` | `Bearer <GitHub fine-grained token>` |
+| Header `Accept` | `application/vnd.github+json` |
+| Header `User-Agent` | `cron-job.org` |
+
+The token is created at <https://github.com/settings/personal-access-tokens/new>
+with access to **only this repository** and the single permission
+**Actions: Read and write**. Tokens expire — when GitHub emails you that it is
+about to, make a new one and paste it into the cron-job.org header.
 
 ---
 

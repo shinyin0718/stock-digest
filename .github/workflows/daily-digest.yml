@@ -1,12 +1,10 @@
 name: Daily digest
 
 on:
-  schedule:
-    # 22:37 UTC Sun-Thu = 06:37 Malaysia time (MYT = UTC+8, no daylight saving)
-    # Mon-Fri, aiming to land by 07:00. GitHub Actions cron is best-effort:
-    # on-the-hour slots regularly run 1-2 hours late, so an off-peak minute is
-    # used deliberately.
-    - cron: "37 22 * * 0-4"
+  # Triggered at 06:55 Malaysia time Mon-Fri by an external scheduler
+  # (cron-job.org) calling the workflow_dispatch API; see README section 3.
+  # A GitHub `schedule:` cron was used before but fired 2.5-4 hours late on
+  # the free tier, so it was removed.
   workflow_dispatch:
 
 jobs:

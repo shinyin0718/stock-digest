@@ -38,7 +38,7 @@ from config import MOVE_THRESHOLD, WATCHLIST_FILE
 
 OUTPUT_DIR = "digests"
 
-HEADLINES_PER_NAME = 4
+HEADLINES_PER_NAME = 10
 NEWS_WINDOW_DAYS = 2
 
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
@@ -195,7 +195,7 @@ def fetch_prices(tickers):
 
 def fetch_news(name, ticker, limit=HEADLINES_PER_NAME):
     """Recent headlines from Google News RSS. No key needed; never raises."""
-    query = f'"{name or ticker}" OR {ticker} stock when:{NEWS_WINDOW_DAYS}d'
+    query = f"{name or ticker} OR {ticker} stock when:{NEWS_WINDOW_DAYS}d"
     url = (
         "https://news.google.com/rss/search?"
         f"q={quote_plus(query)}&hl=en-US&gl=US&ceid=US:en"
@@ -336,6 +336,7 @@ nothing else. Output only the explanation, no preamble."""
         return None
 
     if not text or NO_CLEAR_REASON in text:
+        print(f"  - {ticker}: Gemini found no clear reason in {len(headlines)} headlines", file=sys.stderr)
         return None
     return " ".join(text.split())
 
@@ -346,6 +347,7 @@ def collect_reasons(movers, names, client=None):
     reasons = {}
     for ticker, p in movers:
         headlines = fetch_news(names.get(ticker, ""), ticker)
+        print(f"  - {ticker}: {len(headlines)} headline(s)")
         reasons[ticker] = summarize_reason(
             ticker,
             names.get(ticker, ""),

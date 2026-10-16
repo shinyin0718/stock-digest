@@ -1,7 +1,7 @@
 # stock-digest
 
 A tiny robot that checks your list of stocks and ETFs once a day and sends you a
-Telegram message at **7:00 AM Malaysia time, Monday to Friday**.
+Telegram message at **7:00 AM Malaysia time, Tuesday to Saturday** (each message covers the previous day's trading session, so Saturday reports Friday's close and there is no Monday message).
 
 The message has two parts:
 
@@ -87,8 +87,8 @@ movers do.
 ## 3. Change the time it's sent
 
 The digest is triggered by a free account at [cron-job.org](https://cron-job.org),
-which "presses" GitHub's **Run workflow** button at 06:55 Malaysia time every
-weekday. (GitHub's own built-in schedule was tried first, but on the free tier
+which "presses" GitHub's **Run workflow** button at 06:55 Malaysia time Tuesday to
+Saturday. (GitHub's own built-in schedule was tried first, but on the free tier
 it ran 2.5–4 hours late every day.)
 
 To change the time: log in to cron-job.org → open the **Stock digest** job →

@@ -1,7 +1,7 @@
 name: Daily digest
 
 on:
-  # Triggered at 06:55 Malaysia time Mon-Fri by an external scheduler
+  # Triggered at 06:55 Malaysia time Tue-Sat by an external scheduler
   # (cron-job.org) calling the workflow_dispatch API; see README section 3.
   # A GitHub `schedule:` cron was used before but fired 2.5-4 hours late on
   # the free tier, so it was removed.
